@@ -72,26 +72,35 @@ BLOCK_RADIUS = 0.13         # cells whose centre is closer than this to a LiDAR 
                             # half the robot's width + 2 cm, so a 0.3 m gap is just passable and a 0.25 m one is not
 SOFT_RADIUS = 0.35          # between BLOCK_RADIUS and this, cells cost extra so paths keep to the middle
 PROX_COST = 3.0             # extra step cost right at BLOCK_RADIUS
+SELF_MARGIN = 0.02          # LiDAR returns inside the footprint grown by this are the robot itself (marker posts, cables): dropped
 
 LIDAR_CHECK = False         # True: never drive, just print where the closest LiDAR return is (check ranges[0] is straight ahead on a new robot)
+DEBUG = True                # True: extra "DBG" prints -- why it replans, how it is driving, what the safety layer saw
+DEBUG_MAP_PERIOD = 5.0      # s between ASCII maps of the area around the robot (also printed on entering RECOVER); 0 = never
 
 # Everything that differs between Gazebo and the lab. Positions are in the COURSE frame: origin at the start point,
 # +x up the first corridor, +y to its left (in Gazebo this is the world frame). None of these need to be exact.
 SIM_CONFIG = {
     "bounds": (-0.8, 5.8, -4.6, 1.0),       # xmin, xmax, ymin, ymax of the area the course can occupy (the map is only built inside it)
     "goal": (4.4, -2.6),                    # roughly past the swinging obstacles; the planner goes as close as it can
-    "door_region": (2.5, 4.0, -3.7, -1.9),  # where the centre of the door can be (xmin, xmax, ymin, ymax); None = anywhere
-    "plate_spacing": 0.6,                   # door -> plate line 1 -> plate line 2, only used until the plates are seen
+    "door_region": (2.7, 3.7, -3.4, -2.1),  # where the centre of the door can be (xmin, xmax, ymin, ymax); None = anywhere. The randomiser
+                                            # puts the door line at x 2.8-3.6, gap centre y -3.3..-2.2; obstacle faces never pass x 2.6
+    "door_width": (0.34, 0.55),             # m, gaps accepted as the door (the gate gap is 0.4 m and measures 0.40-0.45)
+    "door_support": (0.15, 0.55),           # m of unbroken wall needed on the shorter / longer side of the gap (a drawer face is 0.48 m)
+    "door_stage_gap": 0.08,                 # m between the front bumper and the door wall where the robot lines up with the gap
+    "plate_spacing": 0.6,                  # door -> plate line 1 -> plate line 2, only used until the plates are seen
     "lidar_start_deg": np.rad2deg(-3.14 + 3.1416),  # direction of ranges[0] in the robot frame (0 = ahead, CCW +ve): scan starts at -3.14 rad, LiDAR mounted turned by pi
     "lidar_step_deg": np.rad2deg(6.28 / 359),       # 360 samples from -3.14 to 3.14 rad; None = 360 / number of samples
+    "lidar_ccw": True,                      # False if the scan goes clockwise (LIDAR_CHECK: an object on the robot's left reads -90 instead of +90)
     "cruise_speed": 0.5,                    # m/s along the A* path
     "door_speed": 0.2,                      # m/s when lining up with / going through the door
     "dash_speed": 1.0,                      # m/s past a swinging plate
-    "strafe_speed": 0.25,                   # m/s sideways (door alignment and lane changes only)
+    "strafe_speed": 0.25,                   # m/s sideways (robot frame); every move is a slide now, so this limits all sideways motion
     "backup_speed": 0.15,                   # m/s when recovering
     "min_run": 0.0,                         # smallest forward/sideways speed that actually moves the robot
     "turn_kp": 2.0, "turn_kd": 0.05,        # heading PID (rad/s per rad of error)
     "max_turn": 2.0, "min_turn": 0.25,      # rad/s
+    "heading_hold_deg": 10.0,               # never turns to steer; only turns back if the heading drifts more than this off course +x (None = never turn)
     "lookahead": 0.35,                      # m, path-following look-ahead
     "replan_period": 0.5,                   # s between A* replans (it also replans as soon as the path gets blocked)
     "refresh_period": 0.25,                 # s between recomputing the map's distance field (~10 ms each on a laptop)
@@ -105,9 +114,11 @@ REAL_CONFIG = dict(SIM_CONFIG, **{
     "bounds": (-1.0, 6.5, -5.0, 1.2),       # TODO measure the lab course (./fp.sh --calibrate) and tighten these
     "goal": (4.4, -2.6),                    # TODO set from the lab course
     "door_region": None,                    # TODO set from the lab course to reject door look-alikes (e.g. two boxes side by side)
+    "door_width": (0.34, 0.8),             # TODO tighten around the lab door's width (logged when DOOR_ALIGN starts)
+    "door_stage_gap": 0.10,                 # a little more room for Optitrack noise and min_run overshoot
     "lidar_start_deg": 0.0,                 # check with LIDAR_CHECK = True
     "lidar_step_deg": None,
-    "cruise_speed": 0.2, "door_speed": 0.1, "dash_speed": 0.3, "strafe_speed": 0.1, "backup_speed": 0.08,
+    "cruise_speed": 0.6, "door_speed": 0.1, "dash_speed": 1.0, "strafe_speed": 0.3, "backup_speed": 0.08,
     "min_run": 0.03,
     "turn_kp": 1.5, "turn_kd": 0.05, "max_turn": 0.6, "min_turn": 0.2,
     "lookahead": 0.3,
@@ -138,12 +149,13 @@ def to_frame(points_r:np.ndarray, pose) -> np.ndarray:
     return np.column_stack((pose[0] + c * points_r[:, 0] - s * points_r[:, 1], pose[1] + s * points_r[:, 0] + c * points_r[:, 1]))
 
 def estimate_wall_axis(points_r:np.ndarray) -> tuple:
-    '''Walls are rectilinear, so short segments between neighbouring scan points mostly point along one of two
-    perpendicular axes. Returns (direction of the axis nearest to straight ahead in degrees, robot frame, in (-45, 45],
-    fraction of segments that agree with it).'''
-    d = np.diff(points_r, axis=0)
+    '''Walls are rectilinear, so segments between nearby scan points mostly point along one of two perpendicular axes.
+    The segments join points a few apart (0.15-0.5 m) rather than neighbours: neighbours are only 1-2 cm apart, and 1 cm
+    of range noise would make their directions random. Returns (direction of the axis nearest to straight ahead in
+    degrees, robot frame, in (-45, 45], fraction of segments that agree with it).'''
+    d = np.vstack([points_r[s:] - points_r[:-s] for s in (4, 8, 16) if len(points_r) > s])
     length = np.hypot(d[:, 0], d[:, 1])
-    d = d[(length > 0.01) & (length < 0.12)]
+    d = d[(length > 0.15) & (length < 0.5)]
     if len(d) < 20:
         return 0.0, 0.0
     ang = np.rad2deg(np.arctan2(d[:, 1], d[:, 0])) % 90.0
@@ -208,12 +220,27 @@ def wall_run(ys:np.ndarray, start:float, direction:int, max_step:float=0.1) -> f
     return float(abs(side[end] - start))
 
 def find_door(points:np.ndarray, sensor:np.ndarray, cx:float, cy:float, region=None, ahead=(0.1, 1.6),
-              half_window:float=1.2, width=(0.26, 0.8), support=(0.15, 0.55)):
-    '''Look for the door: a wall across the course +x direction (all its points share one x, as walls are rectilinear)
-    with a gap in it that the LiDAR can see through. The wall must run unbroken for at least support[0] m on both sides
-    of the gap and support[1] m on one side (two boxes side by side make a gap too, but they are shorter than that).
-    points = course-frame LiDAR points, sensor = LiDAR position, (cx, cy) = robot centre.
-    Returns {"x", "y", "width"} of the nearest such gap, or None.'''
+              half_window:float=1.2, width=(0.4, 0.8), support=(0.15, 0.55), max_tilt:float=12.0, why:list=None):
+    '''Look for the door: a wall across the course +x direction with a gap in it that the LiDAR can see through. The wall
+    may be up to max_tilt deg off square (course frame set a little off the real walls, or walls not quite square): each
+    tilt is tried, square first, by turning the points about the robot so that the wall becomes a line of constant x.
+    One side of the gap needs support[1] m of unbroken wall (two boxes side by side make a gap too, but they are shorter
+    than that); the other support[0] m, or a wall running along x from the gap's edge (a door next to a corridor wall).
+    points = course-frame LiDAR points, sensor = LiDAR position, (cx, cy) = robot centre; why = list that collects why
+    each gap was turned down (debugging).
+    Returns {"x", "y", "width", "runs", "tilt"} of the nearest such gap (course frame), or None.'''
+    for tilt in sorted(np.arange(-max_tilt, max_tilt + 1e-6, 3.0), key=abs):
+        t = math.radians(tilt)
+        m = np.array(((math.cos(t), -math.sin(t)), (math.sin(t), math.cos(t)))) # turns points by tilt about the robot
+        to_course = lambda x, y: (np.array((x, y)) - (cx, cy)) @ m + (cx, cy) # and back
+        door = door_on_square_wall((points - (cx, cy)) @ m.T + (cx, cy), (sensor - (cx, cy)) @ m.T + (cx, cy), cx, cy,
+                                   ahead, half_window, width, support, region, to_course, float(tilt), why)
+        if door is not None:
+            return door
+    return None
+
+def door_on_square_wall(points, sensor, cx, cy, ahead, half_window, width, support, region, to_course, tilt, why):
+    '''find_door for one tilt: points and sensor already turned so that the wall to look for is a line of constant x.'''
     rel = points - (cx, cy)
     p = points[(rel[:, 0] > ahead[0]) & (rel[:, 0] < ahead[1]) & (np.abs(rel[:, 1]) < half_window)]
     if len(p) < 10:
@@ -226,14 +253,21 @@ def find_door(points:np.ndarray, sensor:np.ndarray, cx:float, cy:float, region=N
             continue
         line_x = float(np.median(p[np.abs(p[:, 0] - (edges[k] + 0.015)) < 0.045, 0]))
         ys = np.sort(p[np.abs(p[:, 0] - line_x) < 0.035, 1])
-        best = None
+        best, best_c = None, None
         for g in np.nonzero((np.diff(ys) > width[0]) & (np.diff(ys) < width[1]))[0]:
             lo, hi = ys[g], ys[g + 1]
             centre = (lo + hi) / 2
+            x, y = to_course(line_x, centre)
+            note = f"tilt {tilt:+.0f}: gap x={x:.2f} y={y:.2f} {hi - lo:.2f} m wide"
             runs = (wall_run(ys, lo, -1), wall_run(ys, hi, +1))
-            if min(runs) < support[0] or max(runs) < support[1]:
+            jambs = [run >= support[0] or side_wall_at(p, line_x, edge) for run, edge in zip(runs, (lo, hi))]
+            if not all(jambs) or max(runs) < support[1]:
+                if why is not None:
+                    why.append(f"{note}, wall {runs[0]:.2f} / {runs[1]:.2f} m either side" + ("" if all(jambs) else ", no corridor wall at the short side"))
                 continue
-            if region is not None and not (region[0] <= line_x <= region[1] and region[2] <= centre <= region[3]):
+            if region is not None and not (region[0] <= x <= region[1] and region[2] <= y <= region[3]):
+                if why is not None:
+                    why.append(f"{note}, outside door_region")
                 continue
             # Must see through the middle of the gap; a gap that is an obstacle's shadow on the wall has nothing behind it
             a_lo = math.atan2(lo - sensor[1], line_x - sensor[0])
@@ -243,12 +277,21 @@ def find_door(points:np.ndarray, sensor:np.ndarray, cx:float, cy:float, region=N
             ray_x = points[(angles > a_min + pad) & (angles < a_max - pad), 0]
             through, blocked = np.count_nonzero(ray_x > line_x + 0.1), np.count_nonzero(ray_x < line_x - 0.05)
             if through < 2 or through <= 2 * blocked:
+                if why is not None:
+                    why.append(f"{note}, can't see through it ({through} rays through, {blocked} stopped short)")
                 continue
-            if best is None or abs(centre - cy) < abs(best["y"] - cy):
-                best = {"x": line_x, "y": float(centre), "width": float(hi - lo)}
+            if best is None or abs(centre - cy) < abs(best_c - cy):
+                best, best_c = {"x": float(x), "y": float(y), "width": float(hi - lo), "runs": runs, "tilt": tilt}, centre
         if best is not None:
             return best
     return None
+
+def side_wall_at(points:np.ndarray, line_x:float, y:float, reach:float=0.5) -> bool:
+    '''True if a wall runs along x from the door line at y, beyond the door (a corridor wall that the door opens onto):
+    points sharing that y spread over at least 0.2 m of x within `reach` past the line. A wall on the robot's side of the
+    line doesn't count: that is just a corner of the corridor the robot is in.'''
+    q = points[(np.abs(points[:, 1] - y) < 0.04) & (points[:, 0] > line_x + 0.05) & (points[:, 0] < line_x + reach)]
+    return len(np.unique(np.floor(q[:, 0] / 0.05))) >= 4
 
 def side_walls(points:np.ndarray, cx:float, cy:float, x_range=(-0.4, 1.5), max_side:float=1.5) -> list:
     '''[y of the nearest wall on the left, y of the nearest wall on the right] (walls running along x), or None for
@@ -535,6 +578,8 @@ class ObstacleCourseNode(Node):
         self.raw_pose = None # Pose exactly as Optitrack reported it (real robot only)
         self.frame = self.course = None
         self._ticks = 0
+        self._calib_ref = None # maze pose where the --calibrate heading check started
+        self._pose_msgs = 0 # Optitrack messages since the last --calibrate print
 
         if is_simulation:
             self.max_translate_velocity = 1.4
@@ -588,7 +633,10 @@ class ObstacleCourseNode(Node):
         x, y = msg.pose.position.x, msg.pose.position.y
         heading = np.rad2deg(self.yaw_from_quaternion(msg.pose.orientation))
         self.raw_pose = np.array((x,y,heading))
+        self._pose_msgs += 1
         x, y, heading = optitrack_to_maze(x, y, heading, self.frame) # CA2 maze frame, see optitrack_variables.config
+        if self.pose is not None and math.hypot(x - self.pose[0], y - self.pose[1]) > 0.5: # further than the robot can drive between two poses
+            self.pose_jump = (self.pose.copy(), np.array((x, y, heading)))
         self.pose = np.array((x,y,heading))
         return self.pose
 
@@ -623,9 +671,29 @@ class ObstacleCourseNode(Node):
 
         if self.calibrate and self.raw_pose is not None:
             self._ticks += 1
+            if self._ticks == 1:
+                self.get_logger().info("HEADING CHECK: push the robot straight FORWARD by hand, ~0.4 m; it prints a result after every 0.3 m")
+                # Course frame as INIT will set it: start the robot at the start point facing up the first corridor
+                self._calib_start = {"origin_x": self.pose[0], "origin_y": self.pose[1], "rotation_deg": self.pose[2]}
+                self.get_logger().info("COURSE: 'course (x, y)' is measured from where the robot is now (keep it at the start point, facing up the "
+                                       "first corridor), the same frame as REAL_CONFIG's goal / bounds / door_region")
+            # Heading check: push the robot straight FORWARD by hand; the direction it moved must match its heading
+            if self._calib_ref is None:
+                self._calib_ref = self.pose.copy()
+            dx, dy = self.pose[0] - self._calib_ref[0], self.pose[1] - self._calib_ref[1]
             if self._ticks % 10 == 0: # twice a second
                 ox, oy, oh = self.raw_pose
-                self.get_logger().info(f"optitrack ({ox:+.3f}, {oy:+.3f}, {oh:+7.1f} deg)  ->  maze ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
+                rate, self._pose_msgs = self._pose_msgs / 0.5, 0
+                status = " -- NO NEW POSES: Optitrack is not tracking this robot" if rate == 0 else f" | pushed {math.hypot(dx, dy):.2f} of 0.30 m"
+                cx, cy, _ = maze_to_course(self.pose[0], self.pose[1], self.pose[2], self._calib_start)
+                self.get_logger().info(f"optitrack ({ox:+.3f}, {oy:+.3f}, {oh:+7.1f} deg)  ->  maze ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)"
+                                       f"  ->  course ({cx:+.2f}, {cy:+.2f}) | {rate:.0f} poses/s{status}")
+            if math.hypot(dx, dy) > 0.3:
+                moved = math.degrees(math.atan2(dy, dx))
+                err = wrap_deg(self.pose[2] - moved)
+                fix = f" -> WRONG: add  {self.robot_number} = {wrap_deg(self.frame['heading_offset_deg'] + err):.1f}  under [heading_offsets]"
+                self.get_logger().info(f"HEADING CHECK: moved towards {moved:+.0f} deg, heading says {self.pose[2]:+.0f} deg, error {err:+.0f} deg" + (fix if abs(err) > 10.0 else " (OK)"))
+                self._calib_ref = None
             return # Calibration mode: look, don't drive
 
         ###### INSERT CODE HERE ######
@@ -638,7 +706,7 @@ class ObstacleCourseNode(Node):
     def init_other(self):
         '''Final-project variables (CA2 pattern: called once from __init__).'''
         self.cfg = dict(SIM_CONFIG if self.is_simulation else REAL_CONFIG)
-        self.allow_strafe = True # Hybrid motion: sideways only to line up with the door and to change lane before a plate. False = car-like everywhere
+        self.holding = False # hold_heading is turning back towards course +x
 
         self.state, self.state_since = "INIT", 0.0
         self.init_ticks = 0
@@ -647,6 +715,8 @@ class ObstacleCourseNode(Node):
         self.course_configured = (not self.is_simulation) and any(abs(v) > 1e-9 for v in self.course.values())
         self.frame_ready = self.is_simulation or self.course_configured
         self.start_frame = None
+        self.pose_jump = None # (old, new) maze pose when Optitrack jumps further than the robot can drive (see handle_pose_jump)
+        self.started_at = -math.inf # when INIT handed over to NAVIGATE
         self.cpose = None # pose in the course frame [x, y, heading]
         self.centre = None # centre of the footprint in the course frame [x, y]
 
@@ -680,9 +750,18 @@ class ObstacleCourseNode(Node):
         self.swing_k = 0 # which plate line we are dealing with (0, 1)
         self.lane, self.lane_k = None, None
         self.wait_since = None
+        self.rushing = False # crossing because the plate just swung past: no backing off
 
         self.pose_obj, self.pose_time = None, None
         self.last_log = self.last_warn = -math.inf
+        self.replan_why = "" # what set replan_now (DEBUG prints)
+        self.dbg_last = {} # DEBUG print throttles: key -> (time printed, prints skipped since)
+        self.dbg_mode = None # how follow_path drove on the last tick
+        self.dbg_err = self.dbg_room = None
+        self.dbg_cmd = self.dbg_sent = (0.0, 0.0, 0.0) # the state's command, and what the safety layer let through
+        self.last_map = -math.inf
+        self.self_hits = 0 # LiDAR returns on the robot itself in the last scan (dropped)
+        self.dbg_cmd_dist, self.dbg_pose_ref, self.dbg_pose_t = 0.0, None, -math.inf # DBG POSE: commanded distance and pose since the last print
         self.done_logged = False
 
     def clock(self) -> float:
@@ -697,6 +776,8 @@ class ObstacleCourseNode(Node):
         if not self.is_simulation and self.pose_lost(now):
             self.move_2D()
             return
+        if self.pose_jump is not None:
+            self.handle_pose_jump(now)
         if self.frame_ready:
             self.update_course_pose()
         if self.last_scan is not self.scan_obj:
@@ -708,7 +789,14 @@ class ObstacleCourseNode(Node):
                 self.last_log = now
                 k = int(np.argmin(np.hypot(self.pts_r[:, 0] - LIDAR_X, self.pts_r[:, 1])))
                 bearing = math.degrees(math.atan2(self.pts_r[k, 1], self.pts_r[k, 0] - LIDAR_X))
-                self.get_logger().info(f"LIDAR_CHECK: closest return at {bearing:+.0f} deg (0 = straight ahead, +ve = left)")
+                rel = self.pts_r - np.array((LIDAR_X, 0.0))
+                ang, dist = np.degrees(np.arctan2(rel[:, 1], rel[:, 0])), np.hypot(rel[:, 0], rel[:, 1])
+                sides = []
+                for name, a in (("front", 0.0), ("left", 90.0), ("back", 180.0), ("right", -90.0)):
+                    near = np.abs((ang - a + 180.0) % 360.0 - 180.0) < 5.0
+                    sides.append(f"{name} {dist[near].min():.2f}" if np.any(near) else f"{name} -")
+                self.get_logger().info(f"LIDAR_CHECK: closest return at {bearing:+.0f} deg, {dist[k]:.2f} m (0 = straight ahead, +ve = left)"
+                                       f" | nearest (m): {', '.join(sides)}")
             return
 
         cmd = (0.0, 0.0, 0.0)
@@ -720,7 +808,10 @@ class ObstacleCourseNode(Node):
                 break
             if self.state == state:
                 break
-        self.move_2D(*self.safety_filter(*cmd, now))
+        sent = self.safety_filter(*cmd, now)
+        self.dbg_cmd, self.dbg_sent = cmd, sent
+        self.dbg_cmd_dist += math.hypot(sent[0], sent[1]) * 0.05 # how far the commands should have moved it (20 Hz ticks)
+        self.move_2D(*sent)
         self.log_status(now)
 
     # --- Sense --------------------------------------------------------------------
@@ -739,8 +830,12 @@ class ObstacleCourseNode(Node):
 
     def process_scan(self, now:float):
         '''New scan: points in the robot and course frames, map update, plate tracking.'''
-        step = self.cfg["lidar_step_deg"] or 360.0 / len(self.last_scan)
+        step = (self.cfg["lidar_step_deg"] or 360.0 / len(self.last_scan)) * (1.0 if self.cfg["lidar_ccw"] else -1.0)
         points, valid, dirs, ranges = lidar_points(self.last_scan, self.cfg["lidar_start_deg"], step)
+        own = valid & (points[:, 0] > -ROBOT_REAR - SELF_MARGIN) & (points[:, 0] < ROBOT_FRONT + SELF_MARGIN) & \
+              (np.abs(points[:, 1]) < ROBOT_HALF_WIDTH + SELF_MARGIN)
+        self.self_hits = int(own.sum())
+        valid = valid & ~own # the LiDAR seeing the robot itself: not an obstacle (it would be mapped on top of the robot), and no free-space info
         self.pts_r = points[valid]
         if not self.frame_ready:
             if self.state == "INIT":
@@ -779,11 +874,12 @@ class ObstacleCourseNode(Node):
             self.end_x = min(beyond) if self.end_x is None else 0.8 * self.end_x + 0.2 * min(beyond)
 
     def pose_lost(self, now:float) -> bool:
-        '''Real robot: Optitrack always jitters, so a pose that stops changing for 0.5 s means tracking is lost.'''
-        if self.pose is not self.pose_obj:
-            self.pose_obj, self.pose_time = self.pose, now
+        '''Real robot: Optitrack always jitters, so a pose that stops changing for 0.5 s means tracking is lost. Compare
+        values, not messages: Motive keeps streaming the last pose of a rigid body it can no longer see.'''
+        if self.pose_obj is None or not np.array_equal(self.raw_pose, self.pose_obj):
+            self.pose_obj, self.pose_time = self.raw_pose, now
         if now - self.pose_time > 0.5:
-            self.warn_throttled(now, f"No new Optitrack pose for {now - self.pose_time:.1f} s -- stopped")
+            self.warn_throttled(now, f"Optitrack pose unchanged for {now - self.pose_time:.1f} s (tracking lost?) -- stopped")
             return True
         return False
 
@@ -811,87 +907,109 @@ class ObstacleCourseNode(Node):
         if self.pts_r is None:
             return vx, vy, turn
         if abs(turn) > 0.05 and not rotation_clear(self.pts_r, math.copysign(max(8.0, math.degrees(abs(turn)) * 0.3), turn)):
-            self.replan_now = True
+            self.replan_now, self.replan_why = True, "safety: no room to turn"
             self.warn_throttled(now, f"[{self.state}] safety: no room to turn that way")
+            self.debug("safety_turn", f"SAFETY no room to turn {'left' if turn > 0 else 'right'} (turn {turn:+.2f}); nearest {self.fmt_nearest()}", 0.5)
             turn = 0.0
         speed = math.hypot(vx, vy)
         if speed < 1e-3:
             return vx, vy, turn
         margin = 0.005 if self.state.startswith("DOOR") else 0.01 if self.narrow and self.state == "NAVIGATE" else 0.02
-        allowed = (free_distance(self.pts_r, vx / speed, vy / speed, margin) - 0.04) / 0.35
+        free = free_distance(self.pts_r, vx / speed, vy / speed, margin)
+        allowed = (free - 0.04) / 0.35
         if allowed >= speed:
             self.blocked_since = None
             return vx, vy, turn
         if allowed > 0.03:
+            self.debug("safety_slow", f"SAFETY slowing {speed:.2f} -> {allowed:.2f} m/s: {free:.2f} m free that way; nearest {self.fmt_nearest()}", 1.0)
             return vx * allowed / speed, vy * allowed / speed, turn
         if self.blocked_since is None:
             self.blocked_since = now
-        self.replan_now = True
+        self.replan_now, self.replan_why = True, "safety stop"
         self.warn_throttled(now, f"[{self.state}] safety stop: something in the way")
+        self.debug("safety_stop", f"SAFETY STOP: cmd vx {vx:+.2f} vy {vy:+.2f} has only {free:.2f} m free that way; nearest {self.fmt_nearest()}", 0.5)
         return 0.0, 0.0, turn
 
-    def drive_to(self, target, heading:float, speed:float, tol=(0.04, 0.03, 3.0)) -> tuple:
-        '''Move the footprint centre to target (course frame) and face `heading` (deg). Uses sideways motion when allowed
-        (hybrid mode), otherwise turns towards the target and drives. Returns (command, arrived).'''
-        c, h = self.centre, self.cpose[2]
-        ex, ey = target[0] - c[0], target[1] - c[1]
-        eh = wrap_deg(heading - h)
-        if abs(ex) < tol[0] and abs(ey) < tol[1] and abs(eh) < tol[2]:
-            return (0.0, 0.0, 0.0), True
-        hr = math.radians(h)
-        fx, fy = math.cos(hr) * ex + math.sin(hr) * ey, -math.sin(hr) * ex + math.cos(hr) * ey # error in the robot frame
-        if self.allow_strafe:
-            if abs(eh) > 25.0: # turn first; translating while badly misaligned is unpredictable
-                return (0.0, 0.0, self.heading_control(eh, True)), False
-            vx = self.min_speed(float(np.clip(2.0 * fx, -speed, speed)), fx, tol[0])
-            vy = self.min_speed(float(np.clip(2.0 * fy, -self.cfg["strafe_speed"], self.cfg["strafe_speed"])), fy, tol[1])
-            return (vx, vy, self.heading_control(eh, abs(fx) < tol[0] and abs(fy) < tol[1])), False
-        dist = math.hypot(ex, ey)
-        if dist > min(tol[0], tol[1]):
-            bearing = wrap_deg(math.degrees(math.atan2(ey, ex)) - h)
-            reverse = abs(bearing) > 90.0 and dist < 0.3 # short hops backwards instead of turning round
-            err = wrap_deg(bearing - 180.0) if reverse else bearing
-            if abs(err) > 15.0:
-                return (0.0, 0.0, self.heading_control(err, True)), False
-            v = self.min_speed(min(speed, 2.0 * dist), dist, 0.0)
-            return ((-v if reverse else v), 0.0, self.heading_control(err)), False
-        return (0.0, 0.0, self.heading_control(eh, True)), False
+    def hold_heading(self) -> float:
+        '''The robot never turns to steer. Only if its heading drifts more than heading_hold_deg off course +x does it turn
+        slowly back, until within 2 deg, so the footprint stays lined up with the walls. heading_hold_deg None = never turn.'''
+        limit = self.cfg["heading_hold_deg"]
+        eh = wrap_deg(-self.cpose[2])
+        if limit is None:
+            return 0.0
+        if abs(eh) > limit:
+            self.holding = True
+        elif abs(eh) < 2.0:
+            self.holding = False
+        if not self.holding:
+            self.prev_heading_err = None
+            return 0.0
+        return self.heading_control(eh, True)
 
-    def follow_path(self) -> tuple:
-        '''Car-like path following (CA2 PID ideas): steer the footprint centre at the furthest point of the path within the
-        look-ahead that is in line of sight; slow down for sharp turns, tight spaces and the end of the path.
-        Returns (command, arrived at the end).'''
-        c, h = self.centre, self.cpose[2]
+    def slide(self, vx:float, vy:float) -> tuple:
+        '''Course-frame velocity -> (vx, vy, turn) command. Rotated into the robot frame with the current heading, so the
+        robot moves the right way even if it has turned a little; the only turning is hold_heading.'''
+        hr = math.radians(self.cpose[2])
+        c, s = math.cos(hr), math.sin(hr)
+        return (c * vx + s * vy, -s * vx + c * vy, self.hold_heading())
+
+    def drive_to(self, target, speed:float, tol=(0.04, 0.03)) -> tuple:
+        '''Slide the footprint centre to target (course frame) without turning: along course x at up to `speed`, along y
+        at up to strafe_speed. Returns (command, arrived).'''
+        c = self.centre
+        ex, ey = target[0] - c[0], target[1] - c[1]
+        if abs(ex) < tol[0] and abs(ey) < tol[1]:
+            return (0.0, 0.0, 0.0), True
+        vx = self.min_speed(float(np.clip(2.0 * ex, -speed, speed)), ex, tol[0])
+        vy = self.min_speed(float(np.clip(2.0 * ey, -self.cfg["strafe_speed"], self.cfg["strafe_speed"])), ey, tol[1])
+        return self.slide(vx, vy), False
+
+    def path_lookahead(self) -> tuple:
+        '''Move along the path and pick the point to head for: the furthest point of the path within the look-ahead that
+        is in line of sight. Returns (target, distance to the end of the path); target is None once at the end.'''
+        c = self.centre
         pts = self.path_xy
         d = np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1])
         self.path_idx += int(np.argmin(d[self.path_idx:self.path_idx + 20]))
         if self.path_idx >= len(pts) - 1 and d[-1] < 0.06:
-            return (0.0, 0.0, 0.0), True
-        # Narrow stretch coming up (path within 0.2 m of something)? Then look less far ahead and line up before moving,
-        # so the robot enters gaps straight instead of cutting the corner into them.
+            return None, d[-1]
+        # Narrow stretch coming up (path within 0.2 m of something)? Then look less far ahead, so the robot enters gaps
+        # straight instead of cutting the corner into them.
         ahead = np.array(self.path[self.path_idx:self.path_idx + 10])
-        narrow = bool(np.any(self.grid.dist[ahead[:, 0], ahead[:, 1]] < 0.2))
-        self.narrow = narrow
-        lookahead, max_err = (0.15, 20.0) if narrow else (self.cfg["lookahead"], 45.0)
+        self.narrow = bool(np.any(self.grid.dist[ahead[:, 0], ahead[:, 1]] < 0.2))
+        lookahead = 0.15 if self.narrow else self.cfg["lookahead"]
         far = self.path_idx
         while far + 1 < len(pts) and d[far + 1] <= lookahead:
             far += 1
         while far > self.path_idx + 1 and not self.grid.line_of_sight(c, pts[far]):
             far -= 1
-        target = pts[max(far, min(self.path_idx + 1, len(pts) - 1))]
-        err = wrap_deg(math.degrees(math.atan2(target[1] - c[1], target[0] - c[0])) - h)
+        return pts[max(far, min(self.path_idx + 1, len(pts) - 1))], d[-1]
+
+    def follow_path(self, speed:float) -> tuple:
+        '''Slide along the path towards the look-ahead point without turning: forwards, backwards, sideways or diagonally.
+        Slower in tight spaces and for the end of the path; the sideways part stays within strafe_speed.
+        Returns (command, arrived at the end).'''
+        target, left = self.path_lookahead()
+        if target is None:
+            return (0.0, 0.0, 0.0), True
+        c = self.centre
+        ex, ey = target[0] - c[0], target[1] - c[1]
+        dist = max(math.hypot(ex, ey), 1e-6)
         i, j = self.grid.cell(c[0], c[1])
         room = float(self.grid.dist[i, j]) if self.grid.inside(i, j) else math.inf # distance to the nearest obstacle
-        if abs(err) > 120.0 and room < 0.3: # path goes back the way we came, no room to turn: reverse along it
-            back = wrap_deg(err - 180.0)
-            v = 0.5 * self.cfg["cruise_speed"] * math.cos(math.radians(back)) ** 2
-            return (-self.min_speed(v, d[-1], 0.06), 0.0, self.heading_control(back)), False
-        if abs(err) > max_err:
-            return (0.0, 0.0, self.heading_control(err, True)), False
-        v = self.cfg["cruise_speed"] * math.cos(math.radians(err)) ** 2
-        v *= float(np.clip((room - 0.1) / 0.25, 0.35, 1.0)) # tight spaces
-        v = min(v, 0.05 + 1.5 * d[-1])
-        return (self.min_speed(v, d[-1], 0.06), 0.0, self.heading_control(err)), False
+        v = speed * float(np.clip((room - 0.1) / 0.25, 0.35, 1.0)) # tight spaces
+        v = min(v, 0.05 + 1.5 * left) # end of the path
+        vx, vy, turn = self.slide(v * ex / dist, v * ey / dist)
+        if abs(vy) > self.cfg["strafe_speed"]: # sideways part too fast: slow the whole move down, keeping its direction
+            vx, vy = vx * self.cfg["strafe_speed"] / abs(vy), math.copysign(self.cfg["strafe_speed"], vy)
+        v = math.hypot(vx, vy)
+        if v > 1e-6:
+            k = self.min_speed(v, left, 0.06) / v
+            vx, vy = vx * k, vy * k
+        direction = math.degrees(math.atan2(vy, vx)) # robot frame: 0 = forwards, +90 = left
+        self.debug_mode("forward" if abs(direction) <= 45.0 else "backward" if abs(direction) >= 135.0 else "left" if direction > 0 else "right",
+                        direction, room)
+        return (vx, vy, turn), False
 
     # --- Plan -----------------------------------------------------------------------
     def plan(self, now:float, goal=None):
@@ -900,6 +1018,7 @@ class ObstacleCourseNode(Node):
         goal = self.cfg["goal"] if goal is None else goal
         start = nearest_free(self.grid.blocked, self.grid.clip(self.grid.cell(*self.centre)))
         forced = self.replan_now or self.path is None or self.path_goal != goal
+        why = "no path yet" if self.path is None else "new goal" if self.path_goal != goal else (self.replan_why or "replan requested") if self.replan_now else ""
         self.last_plan, self.replan_now, self.path_goal = now, False, goal
         if start is None:
             self.path = None
@@ -909,10 +1028,16 @@ class ObstacleCourseNode(Node):
         if not forced and path[-1] == self.path[-1] and not self.path_blocked() and \
                 self.path_cost(self.path[self.path_idx:]) <= 1.2 * self.path_cost(path) + 2.0:
             return # routine replan found nothing clearly better: keep the current path, so the robot doesn't dither between two gaps
+        old = 0 if self.path is None else len(self.path) - self.path_idx
+        if not why:
+            why = "path end moved" if path[-1] != self.path[-1] else "old path blocked" if self.path_blocked() else "found a clearly cheaper path"
         self.path, self.path_reached_goal = path, reached
         cells = np.array(path)
         self.path_xy = np.column_stack(self.grid.centre(cells[:, 0], cells[:, 1]))
         self.path_idx = 0
+        b = self.path_bearing()
+        self.debug("plan", f"REPLAN ({why}): {old} -> {len(path)} cells, {'reaches goal' if reached else 'to closest reachable cell'}, "
+                   f"first 0.4 m heads {b:+.0f} deg from heading" + (" = BEHIND the robot" if abs(b) > 120.0 else ""), 0.3)
 
     def path_cost(self, cells:list) -> float:
         '''A* cost of a list of cells on the current map (in cells).'''
@@ -932,7 +1057,7 @@ class ObstacleCourseNode(Node):
             self.grid.refresh()
             self.last_refresh = now
             if self.path is not None and self.path_blocked():
-                self.replan_now = True
+                self.replan_now, self.replan_why = True, "old path now blocked on the map"
         goal_moved = goal is not None and (self.path_goal is None or math.hypot(goal[0] - self.path_goal[0], goal[1] - self.path_goal[1]) > 0.1)
         if self.path is None or self.replan_now or goal_moved or now - self.last_plan > self.cfg["replan_period"]:
             self.plan(now, goal)
@@ -948,7 +1073,8 @@ class ObstacleCourseNode(Node):
     def update_door(self, now:float, ahead=(0.0, 2.0)):
         '''Look for the door again and blend it into self.door. Returns the raw detection (or None).'''
         cx, cy = self.centre
-        found = find_door(self.pts_c, self.sensor_c, cx, cy, self.cfg["door_region"], ahead=ahead, half_window=1.5)
+        found = find_door(self.pts_c, self.sensor_c, cx, cy, self.cfg["door_region"], ahead=ahead, half_window=1.5,
+                          width=self.cfg["door_width"], support=self.cfg["door_support"])
         if found is None:
             return None
         if self.door is None or now - self.door_seen > 1.0:
@@ -1003,7 +1129,7 @@ class ObstacleCourseNode(Node):
             return self.lane
         line = self.tracker.lines[k]
         y_left, y_right = self.walls_lr
-        if line["reversals"] < 2 or y_left is None or y_right is None or not self.allow_strafe:
+        if line["reversals"] < 2 or y_left is None or y_right is None:
             return cy
         lo, hi = y_right + ROBOT_HALF_WIDTH + 0.07, y_left - ROBOT_HALF_WIDTH - 0.07
         if lo >= hi:
@@ -1045,22 +1171,42 @@ class ObstacleCourseNode(Node):
             self.door = {"x": self.cpose[0] - 0.3, "y": float(self.cpose[1]), "width": 0.4}
             self.start_swing(now)
             return None
+        self.started_at = now
         self.set_state("NAVIGATE", now, "start")
         return None
+
+    def handle_pose_jump(self, now:float):
+        '''Optitrack moved the robot further than it can drive (rigid body lost and found again somewhere else). Just after
+        the start, the course frame was probably fixed on the bad pose: fix it again from the new one.'''
+        old, new = self.pose_jump
+        self.pose_jump = None
+        self.get_logger().warn(f"Optitrack pose JUMPED {math.hypot(new[0] - old[0], new[1] - old[1]):.2f} m: maze ({old[0]:.2f}, {old[1]:.2f}, {old[2]:.0f} deg)"
+                               f" -> ({new[0]:.2f}, {new[1]:.2f}, {new[2]:.0f} deg). Check robot {self.robot_number}'s rigid body in Motive")
+        if self.state == "INIT" or (not self.course_configured and now - self.started_at < 5.0):
+            self.start_frame, self.frame_ready = None, self.course_configured
+            self.grid, self.path, self.axis_samples, self.init_ticks = None, None, [], 0
+            self.set_state("INIT", now, "pose jumped just after the start, fixing the course frame again")
 
     def state_navigate(self, now:float):
         '''Zig-zag section: A* on the live LiDAR map towards the rough goal, replanned all the time.'''
         if abs(wrap_deg(self.cpose[2])) < 35.0: # door ahead?
             cx, cy = self.centre
-            door = find_door(self.pts_c, self.sensor_c, cx, cy, self.cfg["door_region"])
+            why = [] if DEBUG else None
+            door = find_door(self.pts_c, self.sensor_c, cx, cy, self.cfg["door_region"],
+                             width=self.cfg["door_width"], support=self.cfg["door_support"], why=why)
             if door is not None and door["x"] - (cx + HALF_LENGTH) < 1.2 and abs(door["y"] - cy) < 0.8:
                 self.door, self.door_seen = door, now
-                self.set_state("DOOR_ALIGN", now, f"door at x={door['x']:.2f}, y={door['y']:.2f}, {door['width']:.2f} m wide")
+                self.set_state("DOOR_ALIGN", now, f"door at x={door['x']:.2f}, y={door['y']:.2f}, {door['width']:.2f} m wide, "
+                               f"wall {door['runs'][0]:.2f} / {door['runs'][1]:.2f} m either side, tilted {door['tilt']:+.0f} deg")
                 return None
+            if door is not None and why is not None:
+                why.insert(0, f"door x={door['x']:.2f} y={door['y']:.2f} seen but not within 1.2 m ahead and 0.8 m to the side")
+            if why:
+                self.debug("door", "DOOR not taken: " + " | ".join(why[:4]) + (f" (+{len(why) - 4} more)" if len(why) > 4 else ""), 1.0)
         self.keep_path_fresh(now)
         if self.path is None:
             return (0.0, 0.0, 0.0)
-        cmd, arrived = self.follow_path()
+        cmd, arrived = self.follow_path(self.cfg["cruise_speed"])
         if arrived:
             self.set_state("DOOR_ALIGN", now, "reached the goal" if self.path_reached_goal else "end of the reachable area, door should be ahead")
             return None
@@ -1076,34 +1222,32 @@ class ObstacleCourseNode(Node):
         if self.recover_from is None:
             self.recover_from = self.centre.copy()
         if math.hypot(*(self.centre - self.recover_from)) < 0.35 and now - self.state_since < 4.0:
-            return (-self.cfg["backup_speed"], 0.0, 0.0)
+            return (-self.cfg["backup_speed"], 0.0, self.hold_heading())
         self.recover_from = None
         self.recoveries += 1
-        self.replan_now = True
+        self.replan_now, self.replan_why = True, "after recovery"
         self.progress_ref = None
         self.set_state(self.resume_state, now, f"recovery {self.recoveries}")
         return None
 
     def state_door_align(self, now:float):
-        '''Line up in front of the door: centred on the gap, facing course +x, a little way back from the wall.'''
+        '''Get right up to the door first, then line up there: centred on the gap, front bumper door_stage_gap short of the
+        wall. Lining up close gives the best view of the gap and only a short straight run in afterwards.'''
         self.update_door(now)
         if self.door is None:
             if now - self.state_since > 4.0:
                 self.resume_state = "NAVIGATE"
                 self.set_state("RECOVER", now, "no door found")
                 return None
-            return (0.0, 0.0, self.heading_control(wrap_deg(-self.cpose[2]), True)) # face +x and keep looking
-        target = (self.door["x"] - 0.45, self.door["y"])
-        i, j = self.grid.cell(*target)
-        if self.grid.inside(i, j) and self.grid.blocked[i, j]: # something right behind the staging point
-            target = (self.door["x"] - 0.32, self.door["y"])
-        if math.hypot(target[0] - self.centre[0], target[1] - self.centre[1]) > 0.35: # far: get there on an A* path first
+            return (0.0, 0.0, self.hold_heading()) # keep looking
+        target = (self.door["x"] - HALF_LENGTH - self.cfg["door_stage_gap"], self.door["y"])
+        if math.hypot(target[0] - self.centre[0], target[1] - self.centre[1]) > 0.08: # not there yet: A* path all the way, no fine lining up
             self.keep_path_fresh(now, target)
             if self.path is not None:
-                cmd, arrived = self.follow_path()
+                cmd, arrived = self.follow_path(self.cfg["door_speed"])
                 if not arrived:
                     return cmd
-        cmd, arrived = self.drive_to(target, 0.0, self.cfg["door_speed"], tol=(0.04, 0.02, 3.0))
+        cmd, arrived = self.drive_to(target, self.cfg["door_speed"], tol=(0.04, 0.02))
         if arrived:
             self.set_state("DOOR_PASS", now, f"lined up on y={self.door['y']:.2f}")
             return None
@@ -1119,33 +1263,28 @@ class ObstacleCourseNode(Node):
         if self.tracker is None: # start watching the plates through the door
             spacing = self.cfg["plate_spacing"]
             self.tracker = PlateTracker([self.door["x"] + spacing, self.door["x"] + 2 * spacing])
-        c, h = self.centre, self.cpose[2]
+        c = self.centre
         if c[0] + HALF_LENGTH < self.door["x"] - 0.05:
             self.update_door(now, ahead=(0.0, 1.0))
         if c[0] - HALF_LENGTH > self.door["x"] + 0.04:
             self.start_swing(now)
             return None
-        ey, eh = self.door["y"] - c[1], wrap_deg(-h)
+        ey = self.door["y"] - c[1]
         before = c[0] + HALF_LENGTH < self.door["x"] - 0.02
-        if before and (abs(ey) > 0.04 or abs(eh) > 6.0):
-            if not self.allow_strafe:
-                self.set_state("DOOR_ALIGN", now, "drifted off the gap")
-                return None
-            vx = 0.0 # fix the alignment before going in
-        else:
-            vx = self.cfg["door_speed"]
-        vy = float(np.clip(2.5 * ey, -0.6 * self.cfg["strafe_speed"], 0.6 * self.cfg["strafe_speed"])) if self.allow_strafe else 0.0
-        if self.allow_strafe and not before: # inside the door: keep off whichever side is closer
+        vx = 0.0 if before and abs(ey) > 0.04 else self.cfg["door_speed"] # off the gap: side-step back onto it before going in
+        vy = float(np.clip(2.5 * ey, -0.6 * self.cfg["strafe_speed"], 0.6 * self.cfg["strafe_speed"]))
+        if not before: # inside the door: keep off whichever side is closer
             left, right = side_clearance(self.pts_r)
             if min(left, right) < 0.04:
                 vy = 0.03 if left > right else -0.03
-        return (vx, vy, self.heading_control(eh))
+        return self.slide(vx, vy)
 
     def state_swing_wait(self, now:float):
-        '''Hold just before plate line k, watch the plate, move to the best lane, and go once it can't reach the lane in time.'''
+        '''Hold just before plate line k, watch the plate, move to the best lane, and go as soon as it swings past the lane
+        (or once it can't reach the lane in time).'''
         k = self.swing_k
         lane = self.pick_lane(k)
-        cmd, ready = self.drive_to((self.stage_x(k), lane), 0.0, self.cfg["door_speed"], tol=(0.05, 0.03, 4.0))
+        cmd, ready = self.drive_to((self.stage_x(k), lane), self.cfg["door_speed"], tol=(0.05, 0.03))
         if not ready:
             return cmd
         if self.wait_since is None:
@@ -1159,15 +1298,32 @@ class ObstacleCourseNode(Node):
             go = unseen_for > timeout and now - self.wait_since > self.cfg["unseen_timeout"] and self.lane_clear(k)
         else:
             go = t_free > self.cfg["cross_safety"] * t_cross
+        self.rushing = not go and self.plate_just_passed(k, now)
+        if self.rushing:
+            self.set_state("SWING_CROSS", now, f"plate {k + 1} just swung past the lane, rushing")
+            return None
         if go:
             self.set_state("SWING_CROSS", now, f"plate {k + 1} " + ("not seen" if t_free is None else f"needs {t_free:.1f} s, crossing takes {t_cross:.1f} s"))
             return None
         return cmd
 
+    def plate_just_passed(self, k:int, now:float) -> bool:
+        '''Plate k overlapped our lane within the last 0.5 s and is now clear of it, moving away: it has to swing out to
+        its far end and back before it can block us again, the longest gap it ever leaves.'''
+        line = self.tracker.lines[k]
+        if not line["seen"] or now - line["last"] > 0.3 or abs(line["v"]) < 0.05:
+            return False
+        lane, w = self.centre[1], self.lane_band() + line["length"] / 2
+        t, y = line["hist"][-1]
+        if abs(y - lane) <= w or line["v"] * (y - lane) <= 0:
+            return False
+        return any(abs(y_old - lane) <= w for t_old, y_old in line["hist"] if t - t_old <= 0.5)
+
     def state_swing_cross(self, now:float):
-        '''Dash past plate line k. Until the front reaches the plate, back off if it will reach our lane first.'''
+        '''Dash past plate line k. Until the front reaches the plate, back off if it will reach our lane first -- unless
+        we went because it had just swung past, then commit.'''
         k = self.swing_k
-        c, h = self.centre, self.cpose[2]
+        c = self.centre
         target = self.cross_target(k)
         if c[0] >= target - 0.03:
             if k == 0:
@@ -1176,14 +1332,14 @@ class ObstacleCourseNode(Node):
             else:
                 self.set_state("DONE", now, "past plate 2")
             return None
-        if c[0] + HALF_LENGTH < self.plate_x(k) - PLATE_HALF_T - 0.02:
+        if not self.rushing and c[0] + HALF_LENGTH < self.plate_x(k) - PLATE_HALF_T - 0.02:
             t_free = self.time_free(k, now)
             remaining = (self.clear_x(k) - c[0]) / self.cfg["dash_speed"] + 0.5 * self.cfg["cross_latency"]
             if t_free is not None and t_free < remaining:
                 self.set_state("SWING_WAIT", now, f"plate {k + 1} coming, backing off")
                 return None
         vx = self.cfg["dash_speed"] if c[0] < self.clear_x(k) else min(self.cfg["dash_speed"], 0.08 + 2.0 * (target - c[0]))
-        return (vx, 0.0, self.heading_control(wrap_deg(-h)))
+        return self.slide(vx, 0.0)
 
     def state_done(self, now:float):
         if not self.done_logged:
@@ -1198,6 +1354,9 @@ class ObstacleCourseNode(Node):
         self.prev_heading_err = None
         self.wait_since = None
         self.progress_ref = None
+        self.dbg_mode = self.dbg_err = self.dbg_room = None
+        if state == "RECOVER":
+            self.print_map("entering RECOVER")
 
     def fmt_pose(self) -> str:
         p = self.cpose if self.cpose is not None else self.pose
@@ -1207,6 +1366,74 @@ class ObstacleCourseNode(Node):
         if now - self.last_warn >= 1.0:
             self.last_warn = now
             self.get_logger().warn(msg)
+
+    def debug(self, key:str, msg:str, period:float=0.0):
+        '''DEBUG print, at most once every `period` s per key; says how many it skipped in between.'''
+        if not DEBUG:
+            return
+        now = self.clock()
+        last, skipped = self.dbg_last.get(key, (-math.inf, 0))
+        if now - last < period:
+            self.dbg_last[key] = (last, skipped + 1)
+            return
+        self.dbg_last[key] = (now, 0)
+        self.get_logger().info(f"DBG {msg}" + (f"  [+{skipped} skipped]" if skipped else ""))
+
+    def debug_mode(self, mode:str, err:float, room:float):
+        '''DEBUG: remember how follow_path is driving; print when that changes (this is what makes it go back and forth).'''
+        self.dbg_err, self.dbg_room = err, room
+        if mode != self.dbg_mode:
+            self.debug("mode", f"DRIVE {self.dbg_mode} -> {mode}: sliding {err:+.0f} deg (robot frame, 0 = forwards, +90 = left), "
+                       f"{room:.2f} m to the nearest wall on the map" + (", narrow" if self.narrow else ""), 0.2)
+            self.dbg_mode = mode
+
+    def path_bearing(self, ahead:float=0.4) -> float:
+        '''Where the path heads: bearing (deg from the robot's heading, +ve left) of its first point more than `ahead` m away.'''
+        pts, c = self.path_xy, self.centre
+        far = np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1]) > ahead
+        p = pts[int(np.argmax(far))] if np.any(far) else pts[-1]
+        return wrap_deg(math.degrees(math.atan2(p[1] - c[1], p[0] - c[0])) - self.cpose[2])
+
+    def fmt_nearest(self) -> str:
+        '''Nearest LiDAR return outside the footprint, in the robot frame (DEBUG prints).'''
+        p = self.pts_r
+        p = p[(p[:, 0] < -ROBOT_REAR) | (p[:, 0] > ROBOT_FRONT) | (np.abs(p[:, 1]) > ROBOT_HALF_WIDTH)]
+        if len(p) == 0:
+            return "none"
+        k = int(np.argmin(np.hypot(p[:, 0] - CENTRE_X, p[:, 1])))
+        return f"({p[k, 0]:+.2f}, {p[k, 1]:+.2f}) m robot frame = {math.degrees(math.atan2(p[k, 1], p[k, 0] - CENTRE_X)):+.0f} deg"
+
+    def print_map(self, why:str="", half:float=1.5):
+        '''DEBUG: ASCII map around the robot, 10 cm per character, course +x UP and +y LEFT (what the robot sees at the start).
+        # wall seen by the LiDAR   + too close to a wall for the robot's centre   . seen free   (blank) never seen
+        * A* path still to drive   ^ < v > the robot and where it faces   G goal   ~ outside the map bounds'''
+        if not DEBUG or self.grid is None or self.centre is None:
+            return
+        g, k = self.grid, 2 # k cells per character
+        n = int(round(half / (k * g.res)))
+        H, W = g.shape
+        ri, rj = (int(v) for v in g.cell(*self.centre))
+        path = set() if self.path is None else {((i - ri) // k, (j - rj) // k) for i, j in self.path[self.path_idx:]}
+        gi, gj = (int(v) for v in g.cell(*(self.path_goal or self.cfg["goal"])))
+        goal = ((gi - ri) // k, (gj - rj) // k)
+        robot = "^<v>"[int((self.cpose[2] + 45.0) % 360.0 // 90.0)]
+        rows = []
+        for a in range(n, -n - 1, -1): # +x up
+            row = ""
+            for b in range(n, -n - 1, -1): # +y left
+                i0, j0 = ri + k * a, rj + k * b
+                if a == 0 and b == 0:
+                    row += robot
+                elif (a, b) == goal:
+                    row += "G"
+                elif i0 < 0 or j0 < 0 or i0 >= H or j0 >= W:
+                    row += "~"
+                else:
+                    blk = (slice(i0, i0 + k), slice(j0, j0 + k))
+                    row += "#" if g.occupied[blk].any() else "*" if (a, b) in path else "+" if g.blocked[blk].any() else "." if (g.score[blk] < 0).any() else " "
+            rows.append("|" + row + "|")
+        self.last_map = self.clock()
+        self.get_logger().info(f"DBG map{' (' + why + ')' if why else ''} at {self.fmt_pose()}, 10 cm/char, course +x up, +y left:\n" + "\n".join(rows))
 
     def log_status(self, now:float):
         '''Once a second, so it doesn't bury the state changes (like CA2's pose print).'''
@@ -1225,6 +1452,34 @@ class ObstacleCourseNode(Node):
             else:
                 msg += f" | plate {self.swing_k + 1} not seen"
         self.get_logger().info(msg)
+        if DEBUG and self.pose is not None and self.cpose is not None:
+            m, cp = self.pose, self.cpose
+            dbg = f"DBG POSE thinks it is at course ({cp[0]:+.3f}, {cp[1]:+.3f}, {cp[2]:+.1f} deg) = maze ({m[0]:+.3f}, {m[1]:+.3f}, {m[2]:+.1f} deg)"
+            if self.dbg_pose_ref is not None:
+                dt = now - self.dbg_pose_t
+                moved = math.hypot(m[0] - self.dbg_pose_ref[0], m[1] - self.dbg_pose_ref[1])
+                dbg += f" | last {dt:.1f} s: commands {self.dbg_cmd_dist:.2f} m, pose moved {moved:.2f} m"
+                if not self.is_simulation:
+                    dbg += f" | {self._pose_msgs / max(dt, 1e-3):.0f} Optitrack msgs/s"
+                    if self.pose_time is not None:
+                        dbg += f", value last changed {now - self.pose_time:.1f} s ago"
+                if self.dbg_cmd_dist > 0.1 and moved < 0.3 * self.dbg_cmd_dist:
+                    dbg += "  <-- POSE NOT FOLLOWING THE COMMANDS: Optitrack frozen/lost, or the wheels aren't moving the robot"
+            self.get_logger().info(dbg)
+            self.dbg_pose_ref, self.dbg_pose_t, self.dbg_cmd_dist, self._pose_msgs = m.copy(), now, 0.0, 0
+        if DEBUG and self.pts_r is not None:
+            c, s = self.dbg_cmd, self.dbg_sent
+            dbg = f"DBG cmd vx {c[0]:+.2f} vy {c[1]:+.2f} turn {c[2]:+.2f}"
+            if any(abs(a - b) > 1e-3 for a, b in zip(c, s)):
+                dbg += f" -> safety sent vx {s[0]:+.2f} vy {s[1]:+.2f} turn {s[2]:+.2f}"
+            if self.dbg_mode is not None:
+                dbg += f" | sliding {self.dbg_mode} ({self.dbg_err:+.0f} deg), room {self.dbg_room:.2f} m"
+            dbg += f" | nearest {self.fmt_nearest()} | {self.self_hits} self-hits dropped"
+            if self.grid is not None:
+                dbg += f" | map {int(self.grid.occupied.sum())} wall cells"
+            self.get_logger().info(dbg)
+            if DEBUG_MAP_PERIOD > 0 and self.mapping and now - self.last_map >= DEBUG_MAP_PERIOD:
+                self.print_map()
 
 
 def main(args=None):
