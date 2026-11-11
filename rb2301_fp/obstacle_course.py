@@ -938,7 +938,7 @@ class ObstacleCourseNode(Node):
             return vx, vy, turn
         margin = 0.005 if self.state.startswith("DOOR") else 0.01 if self.narrow and self.state == "NAVIGATE" else 0.02
         free = free_distance(self.pts_r, vx / speed, vy / speed, margin)
-        allowed = (free - 0.04) / 0.35
+        allowed = (free - 0.02) / 0.35
         if allowed >= speed:
             self.blocked_since = None
             return vx, vy, turn
