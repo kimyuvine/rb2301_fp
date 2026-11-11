@@ -1296,6 +1296,8 @@ class ObstacleCourseNode(Node):
             self.frontier = None
             return (0.0, 0.0, 0.0)
         if self.is_stuck(now):
+            self.bad_frontiers.append((self.frontier, now)) # can't get through to it this way: try another frontier
+            self.frontier = None
             self.resume_state = "NAVIGATE"
             self.set_state("RECOVER", now, "no progress")
             return None
