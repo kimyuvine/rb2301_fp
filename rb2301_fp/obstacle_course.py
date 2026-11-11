@@ -82,9 +82,6 @@ DEBUG_MAP_PERIOD = 5.0      # s between ASCII maps of the area around the robot 
 # +x up the first corridor, +y to its left (in Gazebo this is the world frame). None of these need to be exact.
 SIM_CONFIG = {
     "bounds": (-0.8, 5.8, -4.6, 1.0),       # xmin, xmax, ymin, ymax of the area the course can occupy (the map is only built inside it)
-    "goal": (4.4, -2.6),                    # roughly past the swinging obstacles; the planner goes as close as it can
-    "door_region": (2.7, 3.7, -3.4, -2.1),  # where the centre of the door can be (xmin, xmax, ymin, ymax); None = anywhere. The randomiser
-                                            # puts the door line at x 2.8-3.6, gap centre y -3.3..-2.2; obstacle faces never pass x 2.6
     "door_width": (0.34, 0.55),             # m, gaps accepted as the door (the gate gap is 0.4 m and measures 0.40-0.45)
     "door_support": (0.15, 0.55),           # m of unbroken wall needed on the shorter / longer side of the gap (a drawer face is 0.48 m)
     "door_stage_gap": 0.08,                 # m between the front bumper and the door wall where the robot lines up with the gap
@@ -112,8 +109,6 @@ SIM_CONFIG = {
 }
 REAL_CONFIG = dict(SIM_CONFIG, **{
     "bounds": (-1.0, 6.5, -5.0, 1.2),       # TODO measure the lab course (./fp.sh --calibrate) and tighten these
-    "goal": (4.4, -2.6),                    # TODO set from the lab course
-    "door_region": None,                    # TODO set from the lab course to reject door look-alikes (e.g. two boxes side by side)
     "door_width": (0.34, 0.8),             # TODO tighten around the lab door's width (logged when DOOR_ALIGN starts)
     "door_stage_gap": 0.10,                 # a little more room for Optitrack noise and min_run overshoot
     "lidar_start_deg": 0.0,                 # check with LIDAR_CHECK = True
@@ -219,7 +214,7 @@ def wall_run(ys:np.ndarray, start:float, direction:int, max_step:float=0.1) -> f
     end = int(np.argmax(steps > max_step)) if np.any(steps > max_step) else len(side) - 1
     return float(abs(side[end] - start))
 
-def find_door(points:np.ndarray, sensor:np.ndarray, cx:float, cy:float, region=None, ahead=(0.1, 1.6),
+def find_door(points:np.ndarray, sensor:np.ndarray, cx:float, cy:float, ahead=(0.1, 1.6),
               half_window:float=1.2, width=(0.4, 0.8), support=(0.15, 0.55), max_tilt:float=12.0, why:list=None):
     '''Look for the door: a wall across the course +x direction with a gap in it that the LiDAR can see through. The wall
     may be up to max_tilt deg off square (course frame set a little off the real walls, or walls not quite square): each
@@ -234,12 +229,12 @@ def find_door(points:np.ndarray, sensor:np.ndarray, cx:float, cy:float, region=N
         m = np.array(((math.cos(t), -math.sin(t)), (math.sin(t), math.cos(t)))) # turns points by tilt about the robot
         to_course = lambda x, y: (np.array((x, y)) - (cx, cy)) @ m + (cx, cy) # and back
         door = door_on_square_wall((points - (cx, cy)) @ m.T + (cx, cy), (sensor - (cx, cy)) @ m.T + (cx, cy), cx, cy,
-                                   ahead, half_window, width, support, region, to_course, float(tilt), why)
+                                   ahead, half_window, width, support, to_course, float(tilt), why)
         if door is not None:
             return door
     return None
 
-def door_on_square_wall(points, sensor, cx, cy, ahead, half_window, width, support, region, to_course, tilt, why):
+def door_on_square_wall(points, sensor, cx, cy, ahead, half_window, width, support, to_course, tilt, why):
     '''find_door for one tilt: points and sensor already turned so that the wall to look for is a line of constant x.'''
     rel = points - (cx, cy)
     p = points[(rel[:, 0] > ahead[0]) & (rel[:, 0] < ahead[1]) & (np.abs(rel[:, 1]) < half_window)]
@@ -264,10 +259,6 @@ def door_on_square_wall(points, sensor, cx, cy, ahead, half_window, width, suppo
             if not all(jambs) or max(runs) < support[1]:
                 if why is not None:
                     why.append(f"{note}, wall {runs[0]:.2f} / {runs[1]:.2f} m either side" + ("" if all(jambs) else ", no corridor wall at the short side"))
-                continue
-            if region is not None and not (region[0] <= x <= region[1] and region[2] <= y <= region[3]):
-                if why is not None:
-                    why.append(f"{note}, outside door_region")
                 continue
             # Must see through the middle of the gap; a gap that is an obstacle's shadow on the wall has nothing behind it
             a_lo = math.atan2(lo - sensor[1], line_x - sensor[0])
@@ -353,6 +344,7 @@ class OccupancyGrid:
         self.res = resolution
         self.shape = (int(np.ceil((xmax - self.xmin) / resolution)), int(np.ceil((ymax - self.ymin) / resolution)))
         self.score = np.zeros(self.shape, dtype=np.float32) # > 0: seen occupied, < 0: seen free
+        self.seen = np.zeros(self.shape, dtype=bool) # some ray has reached this cell (the rest is unknown: frontiers border it)
         self.occupied = np.zeros(self.shape, dtype=bool)
         self.hit_sum = np.zeros((3,) + self.shape, dtype=np.float32) # sum of hit x, sum of hit y, number of hits per cell
         self.cx, self.cy = np.meshgrid(*self.centre(np.arange(self.shape[0]), np.arange(self.shape[1])), indexing="ij")
@@ -390,9 +382,13 @@ class OccupancyGrid:
         t = np.arange(0.0, max_free, 0.7 * self.res)
         keep = t[None, :] < (np.minimum(length, max_free) - 0.08)[:, None] # stop short of the end cell
         flat = self.score.reshape(-1)
-        flat[self._flat_cells((origin + dirs[:, None, :] * t[None, :, None])[keep])] -= 1.0
-        flat[self._flat_cells(ends[hits])] += 3.0
+        free_cells, hit_cells = self._flat_cells((origin + dirs[:, None, :] * t[None, :, None])[keep]), self._flat_cells(ends[hits])
+        flat[free_cells] -= 1.0
+        flat[hit_cells] += 3.0
         np.clip(self.score, -4.0, 6.0, out=self.score)
+        seen = self.seen.reshape(-1)
+        seen[free_cells] = True
+        seen[hit_cells] = True
         # Remember where in each cell the hits are, so distances are exact rather than cell centre to cell centre
         i, j = self.cell(ends[hits, 0], ends[hits, 1])
         ok = self.inside(i, j)
@@ -450,6 +446,25 @@ def nearest_free(blocked:np.ndarray, cell:tuple, max_r:int=8):
         return None
     k = int(np.argmin((free[:, 0] + i0 - i) ** 2 + (free[:, 1] + j0 - j) ** 2))
     return (int(free[k, 0] + i0), int(free[k, 1] + j0))
+
+def clusters(mask:np.ndarray) -> list:
+    '''Groups of touching True cells (8-connected), each a list of (i, j).'''
+    left = {(int(i), int(j)) for i, j in np.argwhere(mask)}
+    groups = []
+    while left:
+        todo = [left.pop()]
+        group = list(todo)
+        while todo:
+            i, j = todo.pop()
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    n = (i + di, j + dj)
+                    if n in left:
+                        left.remove(n)
+                        group.append(n)
+                        todo.append(n)
+        groups.append(group)
+    return groups
 
 def astar(blocked:np.ndarray, cost:np.ndarray, start:tuple, goal:tuple) -> tuple:
     '''A* from CA2, reworked so it can replan every half second: heapq frontier instead of a linear search, integer
@@ -676,7 +691,7 @@ class ObstacleCourseNode(Node):
                 # Course frame as INIT will set it: start the robot at the start point facing up the first corridor
                 self._calib_start = {"origin_x": self.pose[0], "origin_y": self.pose[1], "rotation_deg": self.pose[2]}
                 self.get_logger().info("COURSE: 'course (x, y)' is measured from where the robot is now (keep it at the start point, facing up the "
-                                       "first corridor), the same frame as REAL_CONFIG's goal / bounds / door_region")
+                                       "first corridor), the same frame as REAL_CONFIG's bounds")
             # Heading check: push the robot straight FORWARD by hand; the direction it moved must match its heading
             if self._calib_ref is None:
                 self._calib_ref = self.pose.copy()
@@ -732,6 +747,9 @@ class ObstacleCourseNode(Node):
         self.path_idx = 0
         self.path_reached_goal = False
         self.path_goal = None
+        self.frontier = None # (x, y) NAVIGATE is heading for (there is no fixed goal)
+        self.frontier_time = -math.inf
+        self.bad_frontiers = [] # [((x, y), time)] frontiers already reached, skipped for a while
         self.last_plan = self.last_refresh = -math.inf
         self.replan_now = False
         self.prev_heading_err = None
@@ -1012,10 +1030,9 @@ class ObstacleCourseNode(Node):
         return (vx, vy, turn), False
 
     # --- Plan -----------------------------------------------------------------------
-    def plan(self, now:float, goal=None):
-        '''A* from the robot to goal (default: the rough course goal) on the current map.'''
+    def plan(self, now:float, goal:tuple):
+        '''A* from the robot to goal (a frontier, or the point in front of the door) on the current map.'''
         self.grid.refresh()
-        goal = self.cfg["goal"] if goal is None else goal
         start = nearest_free(self.grid.blocked, self.grid.clip(self.grid.cell(*self.centre)))
         forced = self.replan_now or self.path is None or self.path_goal != goal
         why = "no path yet" if self.path is None else "new goal" if self.path_goal != goal else (self.replan_why or "replan requested") if self.replan_now else ""
@@ -1051,7 +1068,7 @@ class ObstacleCourseNode(Node):
         cells = np.array(self.path[self.path_idx + 2:])
         return len(cells) > 0 and bool(np.any(self.grid.blocked[cells[:, 0], cells[:, 1]]))
 
-    def keep_path_fresh(self, now:float, goal=None):
+    def keep_path_fresh(self, now:float, goal:tuple):
         '''Replan on a timer, when the map shows the path is now blocked, or when the safety layer stopped us.'''
         if now - self.last_refresh > self.cfg["refresh_period"]:
             self.grid.refresh()
@@ -1061,6 +1078,45 @@ class ObstacleCourseNode(Node):
         goal_moved = goal is not None and (self.path_goal is None or math.hypot(goal[0] - self.path_goal[0], goal[1] - self.path_goal[1]) > 0.1)
         if self.path is None or self.replan_now or goal_moved or now - self.last_plan > self.cfg["replan_period"]:
             self.plan(now, goal)
+
+    def pick_frontier(self, now:float):
+        '''Where NAVIGATE heads instead of a fixed goal: the biggest frontier -- seen-free cells next to never-seen
+        ones, grouped into touching clusters and scored by size (and a little by distance). None if none is left.'''
+        g = self.grid
+        g.refresh()
+        unknown = ~g.seen
+        edge = np.zeros(g.shape, dtype=bool)
+        edge[1:, :] |= unknown[:-1, :]
+        edge[:-1, :] |= unknown[1:, :]
+        edge[:, 1:] |= unknown[:, :-1]
+        edge[:, :-1] |= unknown[:, 1:]
+        self.bad_frontiers = [(p, t) for p, t in self.bad_frontiers if now - t < 20.0]
+        best, best_score, best_size = None, 0.0, 0
+        for group in clusters(edge & g.seen & ~g.occupied):
+            if len(group) < 4: # smaller ones are noise (a wall seen edge-on with holes in it)
+                continue
+            # Size counts every frontier cell; the target is one the robot's centre can get to (in a narrow passage most
+            # of the frontier is too close to its walls)
+            cells = np.array(group)
+            free = cells[~g.blocked[cells[:, 0], cells[:, 1]]]
+            mid = cells.mean(axis=0)
+            if len(free):
+                cell = free[int(np.argmin(np.hypot(*(free - mid).T)))]
+            else:
+                cell = nearest_free(g.blocked, g.clip((int(round(mid[0])), int(round(mid[1])))), 6)
+                if cell is None:
+                    continue
+            point = (float(g.centre(cell[0], cell[1])[0]), float(g.centre(cell[0], cell[1])[1]))
+            if any(math.dist(point, p) < 0.4 for p, _ in self.bad_frontiers):
+                continue
+            score = len(group) / (1.0 + 0.5 * math.dist(point, self.centre))
+            if self.frontier is not None and math.dist(point, self.frontier) < 0.4:
+                score *= 1.5 # keep going to the same one unless another is clearly better
+            if score > best_score:
+                best, best_score, best_size = point, score, len(group)
+        if best is not None and (self.frontier is None or math.dist(best, self.frontier) > 0.4):
+            self.get_logger().info(f"Exploring towards the frontier at ({best[0]:.2f}, {best[1]:.2f}), {best_size} cells")
+        self.frontier, self.frontier_time = best, now
 
     def is_stuck(self, now:float) -> bool:
         c, h = self.centre, self.cpose[2]
@@ -1073,7 +1129,7 @@ class ObstacleCourseNode(Node):
     def update_door(self, now:float, ahead=(0.0, 2.0)):
         '''Look for the door again and blend it into self.door. Returns the raw detection (or None).'''
         cx, cy = self.centre
-        found = find_door(self.pts_c, self.sensor_c, cx, cy, self.cfg["door_region"], ahead=ahead, half_window=1.5,
+        found = find_door(self.pts_c, self.sensor_c, cx, cy, ahead=ahead, half_window=1.5,
                           width=self.cfg["door_width"], support=self.cfg["door_support"])
         if found is None:
             return None
@@ -1188,11 +1244,11 @@ class ObstacleCourseNode(Node):
             self.set_state("INIT", now, "pose jumped just after the start, fixing the course frame again")
 
     def state_navigate(self, now:float):
-        '''Zig-zag section: A* on the live LiDAR map towards the rough goal, replanned all the time.'''
+        '''Zig-zag section: A* on the live LiDAR map towards the biggest frontier, replanned all the time.'''
         if abs(wrap_deg(self.cpose[2])) < 35.0: # door ahead?
             cx, cy = self.centre
             why = [] if DEBUG else None
-            door = find_door(self.pts_c, self.sensor_c, cx, cy, self.cfg["door_region"],
+            door = find_door(self.pts_c, self.sensor_c, cx, cy,
                              width=self.cfg["door_width"], support=self.cfg["door_support"], why=why)
             if door is not None and door["x"] - (cx + HALF_LENGTH) < 1.2 and abs(door["y"] - cy) < 0.8:
                 self.door, self.door_seen = door, now
@@ -1203,13 +1259,20 @@ class ObstacleCourseNode(Node):
                 why.insert(0, f"door x={door['x']:.2f} y={door['y']:.2f} seen but not within 1.2 m ahead and 0.8 m to the side")
             if why:
                 self.debug("door", "DOOR not taken: " + " | ".join(why[:4]) + (f" (+{len(why) - 4} more)" if len(why) > 4 else ""), 1.0)
-        self.keep_path_fresh(now)
+        # No fixed goal: head for the biggest frontier on the live map, picked again every second
+        if self.frontier is None or now - self.frontier_time > 1.0:
+            self.pick_frontier(now)
+        if self.frontier is None:
+            self.set_state("DOOR_ALIGN", now, "nothing left to explore, door should be ahead")
+            return None
+        self.keep_path_fresh(now, self.frontier)
         if self.path is None:
             return (0.0, 0.0, 0.0)
         cmd, arrived = self.follow_path(self.cfg["cruise_speed"])
-        if arrived:
-            self.set_state("DOOR_ALIGN", now, "reached the goal" if self.path_reached_goal else "end of the reachable area, door should be ahead")
-            return None
+        if arrived: # reached that frontier (or as close as it can get): on to the next one
+            self.bad_frontiers.append((self.frontier, now))
+            self.frontier = None
+            return (0.0, 0.0, 0.0)
         if self.is_stuck(now):
             self.resume_state = "NAVIGATE"
             self.set_state("RECOVER", now, "no progress")
@@ -1406,7 +1469,7 @@ class ObstacleCourseNode(Node):
     def print_map(self, why:str="", half:float=1.5):
         '''DEBUG: ASCII map around the robot, 10 cm per character, course +x UP and +y LEFT (what the robot sees at the start).
         # wall seen by the LiDAR   + too close to a wall for the robot's centre   . seen free   (blank) never seen
-        * A* path still to drive   ^ < v > the robot and where it faces   G goal   ~ outside the map bounds'''
+        * A* path still to drive   ^ < v > the robot and where it faces   G end of the A* path   ~ outside the map bounds'''
         if not DEBUG or self.grid is None or self.centre is None:
             return
         g, k = self.grid, 2 # k cells per character
@@ -1414,8 +1477,10 @@ class ObstacleCourseNode(Node):
         H, W = g.shape
         ri, rj = (int(v) for v in g.cell(*self.centre))
         path = set() if self.path is None else {((i - ri) // k, (j - rj) // k) for i, j in self.path[self.path_idx:]}
-        gi, gj = (int(v) for v in g.cell(*(self.path_goal or self.cfg["goal"])))
-        goal = ((gi - ri) // k, (gj - rj) // k)
+        goal = None # where the current A* path goes (a frontier, or the point in front of the door)
+        if self.path_goal is not None:
+            gi, gj = (int(v) for v in g.cell(*self.path_goal))
+            goal = ((gi - ri) // k, (gj - rj) // k)
         robot = "^<v>"[int((self.cpose[2] + 45.0) % 360.0 // 90.0)]
         rows = []
         for a in range(n, -n - 1, -1): # +x up
