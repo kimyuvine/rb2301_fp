@@ -762,6 +762,8 @@ class ObstacleCourseNode(Node):
 
         self.door = None # smoothed door estimate {"x", "y", "width"}
         self.door_seen = -math.inf
+        self.rejected_doors = [] # [(x, y, time)] gaps that turned out not to be the gate, ignored for a while
+        self.plate_seen_at = None # last time anything plate-like was measured past the door
         self.tracker = None
         self.walls_lr = [None, None] # y of the corridor walls left/right past the door
         self.end_x = None # x of the end wall
@@ -886,6 +888,8 @@ class ObstacleCourseNode(Node):
         x_min = self.door["x"] + 0.12
         x_max = self.end_x - 0.12 if self.end_x is not None else cx + 2.5
         plates, walls_x = plate_measurements(self.pts_c, x_min, x_max, y_lo, y_hi)
+        if plates:
+            self.plate_seen_at = now
         self.tracker.update(now, plates)
         beyond = [x for x in walls_x if x > self.tracker.lines[-1]["x"] + 0.2]
         if beyond:
@@ -1118,12 +1122,12 @@ class ObstacleCourseNode(Node):
             self.get_logger().info(f"Exploring towards the frontier at ({best[0]:.2f}, {best[1]:.2f}), {best_size} cells")
         self.frontier, self.frontier_time = best, now
 
-    def is_stuck(self, now:float) -> bool:
+    def is_stuck(self, now:float, limit:float=3.0) -> bool:
         c, h = self.centre, self.cpose[2]
         if self.progress_ref is None or math.hypot(*(c - self.progress_ref[1])) > 0.05 or abs(wrap_deg(h - self.progress_ref[2])) > 15.0:
             self.progress_ref = (now, c.copy(), h)
             return False
-        return now - self.progress_ref[0] > 3.0
+        return now - self.progress_ref[0] > limit
 
     # --- Door -----------------------------------------------------------------------
     def update_door(self, now:float, ahead=(0.0, 2.0)):
@@ -1131,7 +1135,7 @@ class ObstacleCourseNode(Node):
         cx, cy = self.centre
         found = find_door(self.pts_c, self.sensor_c, cx, cy, ahead=ahead, half_window=1.5,
                           width=self.cfg["door_width"], support=self.cfg["door_support"])
-        if found is None:
+        if found is None or self.is_rejected(found, now):
             return None
         if self.door is None or now - self.door_seen > 1.0:
             self.door = dict(found)
@@ -1142,6 +1146,19 @@ class ObstacleCourseNode(Node):
             return None # a different gap; keep the current estimate
         self.door_seen = now
         return found
+
+    def is_rejected(self, door:dict, now:float) -> bool:
+        '''This gap turned out not to be the gate in the last 30 s (a gap between two obstacles can look like a door).'''
+        self.rejected_doors = [d for d in self.rejected_doors if now - d[2] < 30.0]
+        return any(math.hypot(door["x"] - x, door["y"] - y) < 0.3 for x, y, _ in self.rejected_doors)
+
+    def reject_door(self, now:float, why:str):
+        '''The gap being used is not the gate: ignore it for 30 s, map again, back up a little and go back to exploring.'''
+        self.rejected_doors.append((self.door["x"], self.door["y"], now))
+        self.door, self.tracker, self.mapping, self.swing_k, self.lane = None, None, True, 0, None
+        self.walls_lr, self.end_x, self.plate_seen_at = [None, None], None, None
+        self.resume_state = "NAVIGATE"
+        self.set_state("RECOVER", now, f"that was not the gate ({why}), back to exploring")
 
     def start_swing(self, now:float):
         '''Past the door: stop mapping, start (or keep) tracking the plates, deal with plate 1.'''
@@ -1241,6 +1258,7 @@ class ObstacleCourseNode(Node):
         if self.state == "INIT" or (not self.course_configured and now - self.started_at < 5.0):
             self.start_frame, self.frame_ready = None, self.course_configured
             self.grid, self.path, self.axis_samples, self.init_ticks = None, None, [], 0
+            self.frontier, self.bad_frontiers = None, [] # they were in the old course frame
             self.set_state("INIT", now, "pose jumped just after the start, fixing the course frame again")
 
     def state_navigate(self, now:float):
@@ -1250,6 +1268,10 @@ class ObstacleCourseNode(Node):
             why = [] if DEBUG else None
             door = find_door(self.pts_c, self.sensor_c, cx, cy,
                              width=self.cfg["door_width"], support=self.cfg["door_support"], why=why)
+            if door is not None and self.is_rejected(door, now):
+                if why is not None:
+                    why.insert(0, f"door x={door['x']:.2f} y={door['y']:.2f} was already found not to be the gate")
+                door = None
             if door is not None and door["x"] - (cx + HALF_LENGTH) < 1.2 and abs(door["y"] - cy) < 0.8:
                 self.door, self.door_seen = door, now
                 self.set_state("DOOR_ALIGN", now, f"door at x={door['x']:.2f}, y={door['y']:.2f}, {door['width']:.2f} m wide, "
@@ -1315,9 +1337,7 @@ class ObstacleCourseNode(Node):
             self.set_state("DOOR_PASS", now, f"lined up on y={self.door['y']:.2f}")
             return None
         if now - self.state_since > 25.0:
-            self.resume_state = "NAVIGATE"
-            self.door = None
-            self.set_state("RECOVER", now, "could not line up with the door")
+            self.reject_door(now, "could not line up with it")
             return None
         return cmd
 
@@ -1331,6 +1351,9 @@ class ObstacleCourseNode(Node):
             self.update_door(now, ahead=(0.0, 1.0))
         if c[0] - HALF_LENGTH > self.door["x"] + 0.04:
             self.start_swing(now)
+            return None
+        if self.is_stuck(now, 6.0): # something in the way the whole time: this gap can't be the gate
+            self.reject_door(now, "could not get through it")
             return None
         ey = self.door["y"] - c[1]
         before = c[0] + HALF_LENGTH < self.door["x"] - 0.02
@@ -1352,6 +1375,11 @@ class ObstacleCourseNode(Node):
             return cmd
         if self.wait_since is None:
             self.wait_since = now
+        if k == 0 and self.plate_seen_at is None and now - self.wait_since > self.cfg["unseen_timeout"]:
+            # Nothing plate-like anywhere past this gap: it was not the gate. Without this it would "cross" two plates it
+            # never saw and say DONE in the wrong place.
+            self.reject_door(now, "no swinging plate past it")
+            return None
         t_cross = (self.clear_x(k) - self.centre[0]) / self.cfg["dash_speed"] + self.cfg["cross_latency"]
         t_free = self.time_free(k, now)
         if t_free is None: # never seen (maybe not there) or lost (hidden?): go only once the lane has stayed clear for a while
